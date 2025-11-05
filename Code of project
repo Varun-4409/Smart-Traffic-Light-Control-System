@@ -1,0 +1,246 @@
+// smart_traffic.cpp
+// Compile: g++ -std=c++17 smart_traffic.cpp -o smart_traffic
+// Run: ./smart_traffic
+
+#include <bits/stdc++.h>
+using namespace std;
+using ll = long long;
+
+enum LightState { RED, GREEN };
+
+struct TrafficLight {
+    string dir;           // "N", "E", "S", "W"
+    LightState state;
+    int remaining;        // seconds remaining in current state
+    int servedCycles;     // number of times served (for fairness)
+    TrafficLight(string d=""): dir(d), state(RED), remaining(0), servedCycles(0) {}
+};
+
+struct Sensor {
+    // provides counts (vehicles) per direction for a moment
+    // counts represent number of waiting vehicles
+    array<int,4> counts; // N,E,S,W
+    Sensor(): counts({0,0,0,0}) {}
+    void randomize(int maxVehicles=20) {
+        for (int i=0;i<4;i++) counts[i] = rand() % (maxVehicles+1);
+    }
+    void setCounts(const array<int,4>& c) { counts = c; }
+};
+
+struct Controller {
+    int cycleTime;        // total cycle time (sum of green times)
+    int minGreen;         // minimum green per approach
+    int maxGreen;         // maximum green per approach
+    int starveThreshold;  // cycles without service to trigger boost
+
+    Controller(int cycleT=60, int minG=8, int maxG=40, int starve=3)
+        : cycleTime(cycleT), minGreen(minG), maxGreen(maxG), starveThreshold(starve) {}
+
+    // allocate green durations (seconds) for 4 directions based on counts (proportional)
+    array<int,4> allocateGreen(const array<int,4>& counts, const array<int,4>& lastServedAgo) {
+        array<int,4> green = {0,0,0,0};
+        int total = counts[0]+counts[1]+counts[2]+counts[3];
+        if (total == 0) {
+            // no cars -> equal small green to keep cycles moving
+            for (int i=0;i<4;i++) green[i] = cycleTime/4;
+            return green;
+        }
+
+        // proportional allocation
+        double totalD = (double)total;
+        int assigned = 0;
+        for (int i=0;i<4;i++) {
+            double frac = counts[i] / totalD;
+            int g = max(minGreen, (int)round(frac * cycleTime));
+            g = min(g, maxGreen);
+            green[i] = g;
+            assigned += g;
+        }
+
+        // adjust to match cycleTime by distributing remainder/overfill
+        int diff = cycleTime - assigned;
+        // if diff > 0 distribute to largest queues
+        if (diff > 0) {
+            // sort directions by counts descending
+            vector<int> idx = {0,1,2,3};
+            sort(idx.begin(), idx.end(), [&](int a,int b){ return counts[a] > counts[b]; });
+            int i=0;
+            while (diff>0) {
+                int d = idx[i%4];
+                int canAdd = maxGreen - green[d];
+                if (canAdd>0) {
+                    int add = min(canAdd, diff);
+                    green[d]+=add;
+                    diff-=add;
+                }
+                i++;
+                // if no one can accept more, break
+                if (i>100) break;
+            }
+        } else if (diff < 0) {
+            // we need to shave seconds off - remove from smallest queues first
+            vector<int> idx = {0,1,2,3};
+            sort(idx.begin(), idx.end(), [&](int a,int b){ return counts[a] < counts[b]; });
+            int i=0;
+            while (diff<0) {
+                int d = idx[i%4];
+                int canRemove = green[d] - minGreen;
+                if (canRemove>0) {
+                    int rem = min(canRemove, -diff);
+                    green[d]-=rem;
+                    diff+=rem;
+                }
+                i++;
+                if (i>100) break;
+            }
+        }
+
+        // starvation handling: if last served ago >= threshold, ensure at least minGreen
+        for (int i=0;i<4;i++) {
+            if (lastServedAgo[i] >= starveThreshold && green[i] < minGreen) {
+                // give a boost (steal from largest)
+                int stealFrom = argmax(counts, green);
+                if (stealFrom != -1 && green[stealFrom] - minGreen >= (minGreen - green[i])) {
+                    int steal = min(green[stealFrom] - minGreen, minGreen - green[i]);
+                    green[stealFrom] -= steal;
+                    green[i] += steal;
+                } else {
+                    green[i] = minGreen; // last-resort
+                }
+            }
+        }
+
+        return green;
+    }
+
+    static int argmax(const array<int,4>& counts, const array<int,4>& green) {
+        int best = -1; int bestVal = -1;
+        for (int i=0;i<4;i++){
+            int val = counts[i];
+            if (best==-1 || val > bestVal) { best=i; bestVal=val;}
+        }
+        return best;
+    }
+};
+
+struct Simulation {
+    vector<TrafficLight> lights; // 0:N,1:E,2:S,3:W
+    Sensor sensor;
+    Controller controller;
+    int cyclesToRun;
+    bool verbose;
+
+    // stats
+    array<int,4> totalServed; // cumulative vehicles served (approx)
+    array<int,4> lastServedCycle; // cycles since last served
+    int currentCycle;
+
+    Simulation(int cycles=10, bool v=true)
+        : controller(60,8,40,3), cyclesToRun(cycles), verbose(v), currentCycle(0)
+    {
+        lights = { TrafficLight("N"), TrafficLight("E"), TrafficLight("S"), TrafficLight("W") };
+        totalServed = {0,0,0,0};
+        lastServedCycle = {0,0,0,0};
+    }
+
+    void runInteractive() {
+        cout << "Interactive mode - input counts for N E S W (0 0 0 0 to randomize) per cycle.\n";
+        for (int c=0;c<cyclesToRun;c++) {
+            currentCycle = c+1;
+            cout << "\nCycle " << currentCycle << " - Enter 4 ints (N E S W) or -1 to randomize: ";
+            array<int,4> counts;
+            for (int i=0;i<4;i++) cin >> counts[i];
+            if (counts[0] < 0) { sensor.randomize(); }
+            else sensor.setCounts(counts);
+            simulateOneCycle();
+        }
+    }
+
+    void runRandom() {
+        for (int c=0;c<cyclesToRun;c++) {
+            currentCycle = c+1;
+            sensor.randomize(25);
+            simulateOneCycle();
+        }
+    }
+
+    void runScenario(const vector<array<int,4>>& scenario) {
+        for (size_t i=0;i<scenario.size() && i < (size_t)cyclesToRun; ++i) {
+            currentCycle = i+1;
+            sensor.setCounts(scenario[i]);
+            simulateOneCycle();
+        }
+    }
+
+    void simulateOneCycle() {
+        if (verbose) {
+            cout << "=== Cycle " << currentCycle << " ===\n";
+            printCounts();
+        }
+        // compute lastServedAgo: we store cycles since last served (increase all by 1)
+        for (int i=0;i<4;i++) {
+            lastServedCycle[i] += 1;
+        }
+        // allocate green times
+        auto green = controller.allocateGreen(sensor.counts, lastServedCycle);
+        if (verbose) {
+            cout << "Allocated green seconds (N E S W): ";
+            for (int i=0;i<4;i++) cout << green[i] << (i<3?" ":"\n");
+        }
+
+        // simulate sequential phases: N -> E -> S -> W
+        for (int i=0;i<4;i++) {
+            int g = green[i];
+            if (g <= 0) continue;
+            // "serve" vehicles: assume each second 1 vehicle passes per lane (simple)
+            int served = min(g, sensor.counts[i]);
+            totalServed[i] += served;
+            sensor.counts[i] = max(0, sensor.counts[i] - served);
+            lights[i].servedCycles++;
+            lastServedCycle[i] = 0; // reset since served
+            if (verbose) {
+                cout << lights[i].dir << " GREEN for " << g << "s, served ~" << served << " vehicles; remaining "
+                     << sensor.counts[i] << "\n";
+            }
+        }
+
+        if (verbose) printStats();
+    }
+
+    void printCounts() {
+        cout << "Current counts (N E S W): ";
+        for (int i=0;i<4;i++) cout << sensor.counts[i] << (i<3?" ":"\n");
+    }
+
+    void printStats() {
+        cout << "Cumulative served (N E S W): ";
+        for (int i=0;i<4;i++) cout << totalServed[i] << (i<3?" ":"\n");
+    }
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+    srand((unsigned)time(NULL));
+
+    cout << "Smart Traffic Light Simulation\n";
+    cout << "1) Random runs\n2) Interactive manual input\n3) Example scenario\nChoose mode: ";
+    int mode; if (!(cin >> mode)) return 0;
+    int cycles = 8;
+    cout << "Enter cycles to run (default 8): ";
+    if (!(cin >> cycles)) cycles = 8;
+
+    Simulation sim(cycles, true);
+    if (mode==1) sim.runRandom();
+    else if (mode==2) sim.runInteractive();
+    else {
+        // example scenario: rush N & S, low E & W, then reverse
+        vector<array<int,4>> scenario = {
+            {18,4,20,3}, {20,3,25,2}, {2,16,4,18}, {3,20,2,22},
+            {15,10,15,8}, {0,0,0,0}, {6,6,6,6}, {25,5,3,2}
+        };
+        sim.runScenario(scenario);
+    }
+    cout << "\nSimulation finished.\n";
+    return 0;
+}
